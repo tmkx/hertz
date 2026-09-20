@@ -106,8 +106,32 @@ func (routerNode *RouterNode) Update(method *HttpMethod, handlerType, handlerPkg
 
 func (routerNode *RouterNode) RawHandlerName() string {
 	parts := strings.Split(routerNode.Handler, ".")
-	handlerName := parts[len(parts)-1]
-	return handlerName
+	name := parts[len(parts)-1]
+	for _, prefix := range []string{
+		"_" + name,
+		"_" + convertToMiddlewareName(name),
+	} {
+		if strings.HasPrefix(routerNode.HandlerMiddleware, prefix) {
+			return name + strings.TrimPrefix(routerNode.HandlerMiddleware, prefix)
+		}
+	}
+	return name
+}
+
+// RawGroupName returns the path-derived group name with its original case.
+// Retain any suffix allocated by the default middleware naming rules so that
+// groups with the same path segment remain distinct in custom templates.
+func (routerNode *RouterNode) RawGroupName() string {
+	if routerNode.Path == "/" {
+		return "root"
+	}
+	path := strings.TrimPrefix(routerNode.Path, "/")
+	name := util.ToVarName([]string{strings.TrimLeft(path, ":*")})
+	prefix := "_" + convertToMiddlewareName(path)
+	if strings.HasPrefix(routerNode.GroupMiddleware, prefix) {
+		name += strings.TrimPrefix(routerNode.GroupMiddleware, prefix)
+	}
+	return name
 }
 
 // DyeGroupName traverses the routing tree in depth and names the handler/group middleware for each node.
@@ -509,15 +533,15 @@ func (pkgGen *HttpPackageGenerator) updateMiddlewareReg(router interface{}, midd
 	if !isExist {
 		return pkgGen.TemplateGenerator.Generate(router, middlewareTpl, filePath, false)
 	}
-	var middlewareList []string
+	var middlewareList []map[string]string
 
 	_ = router.(Router).Router.DFS(0, func(layer int, node *RouterNode) error {
 		// non-leaf node will generate group middleware
 		if node.Children.Len() > 0 && len(node.GroupMiddleware) > 0 {
-			middlewareList = append(middlewareList, node.GroupMiddleware)
+			middlewareList = append(middlewareList, map[string]string{"MiddleWare": node.GroupMiddleware, "RawName": node.RawGroupName()})
 		}
 		if len(node.HandlerMiddleware) > 0 {
-			middlewareList = append(middlewareList, node.HandlerMiddleware)
+			middlewareList = append(middlewareList, map[string]string{"MiddleWare": node.HandlerMiddleware, "RawName": node.RawHandlerName()})
 		}
 		return nil
 	})
@@ -527,10 +551,19 @@ func (pkgGen *HttpPackageGenerator) updateMiddlewareReg(router interface{}, midd
 		return err
 	}
 
-	for _, mw := range middlewareList {
+	for _, data := range middlewareList {
+		mw := data["MiddleWare"]
 		mwNamePattern := fmt.Sprintf(" %sMw", mw)
 		if pkgGen.SnakeStyleMiddleware {
 			mwNamePattern = fmt.Sprintf(" %s_mw", mw)
+		}
+		// Custom templates can use the same naming expression for generation
+		// and duplicate detection, without changing the default naming rules.
+		if tplInfo := pkgGen.tplsInfo[middlewareSingleTplName]; tplInfo != nil && tplInfo.UpdateBehavior.InsertKey != "" {
+			mwNamePattern, err = renderInsertKey(tplInfo, data)
+			if err != nil {
+				return err
+			}
 		}
 		if bytes.Contains(file, []byte(mwNamePattern)) {
 			continue
@@ -539,8 +572,6 @@ func (pkgGen *HttpPackageGenerator) updateMiddlewareReg(router interface{}, midd
 		if middlewareSingleTpl == nil {
 			return fmt.Errorf("tpl %s not found", middlewareSingleTplName)
 		}
-		data := make(map[string]string, 1)
-		data["MiddleWare"] = mw
 		middlewareFunc := bytes.NewBuffer(nil)
 		err = middlewareSingleTpl.Execute(middlewareFunc, data)
 		if err != nil {

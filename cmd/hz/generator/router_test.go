@@ -16,7 +16,13 @@
 
 package generator
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"text/template"
+)
 
 func Test_checkDupRegister(t *testing.T) {
 	type args struct {
@@ -67,5 +73,101 @@ func Test_checkDupRegister(t *testing.T) {
 				t.Errorf("checkDupRegister() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestUpdateMiddlewareRegCustomNames(t *testing.T) {
+	for _, custom := range []bool{false, true} {
+		name := "{{.MiddleWare}}Mw"
+		handlerName := "_getllmresponseMw"
+		duplicateHandlerName := "_getllmresponse0Mw"
+		groupName := "_collectionuidMw"
+		info := &Template{}
+		if custom {
+			name = "{{if ne .MiddleWare \"root\"}}_{{end}}{{untitle .RawName}}Mw"
+			handlerName = "_getLLMResponseMw"
+			duplicateHandlerName = "_getLLMResponse0Mw"
+			groupName = "_collectionUidMw"
+			info.UpdateBehavior.InsertKey = "func " + name + "("
+		}
+		gen := &HttpPackageGenerator{}
+		gen.tplsInfo = map[string]*Template{middlewareTplName: {}, middlewareSingleTplName: info}
+		gen.tpls = map[string]*template.Template{
+			middlewareSingleTplName: template.Must(template.New("single").Funcs(funcMap).Parse("\nfunc " + name + "() []app.HandlerFunc { return nil }\n")),
+		}
+		path := filepath.Join(t.TempDir(), "middleware.go")
+		// The handler exists, but renaming :uid to :collectionUid adds a group.
+		source := "package service\nfunc _uidMw() {}\nfunc " + handlerName + "() []app.HandlerFunc { return authenticate() }\n"
+		if err := os.WriteFile(path, []byte(source), 0600); err != nil {
+			t.Fatal(err)
+		}
+		duplicateHandler := &RouterNode{
+			Path:              "/duplicate",
+			HandlerMiddleware: "_getllmresponse0",
+			Handler:           "handler.GetLLMResponse",
+		}
+		router := Router{Router: &RouterNode{
+			Path: "/:collectionUid", GroupMiddleware: "_collectionuid", HandlerMiddleware: "_getllmresponse",
+			Handler: "handler.GetLLMResponse", Children: childrenRouterInfo{duplicateHandler},
+		}}
+		for i := 0; i < 2; i++ {
+			if err := gen.updateMiddlewareReg(router, middlewareTplName, path); err != nil {
+				t.Fatal(err)
+			}
+			got := gen.files[len(gen.files)-1].Content
+			if !strings.HasPrefix(got, source) {
+				t.Fatal("existing middleware changed")
+			}
+			for _, fn := range []string{groupName, handlerName, duplicateHandlerName} {
+				if strings.Count(got, "func "+fn+"()") != 1 {
+					t.Fatalf("custom=%v: missing or duplicate %s: %s", custom, fn, got)
+				}
+			}
+			if err := os.WriteFile(path, []byte(got), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		router.Router.Handler = "handler.NewMethod"
+		router.Router.HandlerMiddleware = "_newmethod"
+		if err := gen.updateMiddlewareReg(router, middlewareTplName, path); err != nil {
+			t.Fatal(err)
+		}
+		want := "_newmethodMw"
+		if custom {
+			want = "_newMethodMw"
+		}
+		if !strings.Contains(gen.files[len(gen.files)-1].Content, "func "+want+"()") {
+			t.Fatal("new method middleware missing")
+		}
+	}
+}
+
+func TestRawGroupName(t *testing.T) {
+	for _, tc := range []struct{ path, middleware, want string }{
+		{"/", "root", "root"},
+		{"/:collectionUid", "_collectionuid", "collectionUid"},
+		{"/:collectionUid", "_collectionuid0", "collectionUid0"},
+		{"/userID", "_userid", "userID"},
+		{"/*filePath", "__2afilepath", "filePath"},
+	} {
+		node := &RouterNode{Path: tc.path, GroupMiddleware: tc.middleware}
+		if got := node.RawGroupName(); got != tc.want {
+			t.Errorf("RawGroupName(%q, %q) = %q, want %q", tc.path, tc.middleware, got, tc.want)
+		}
+	}
+}
+
+func TestRawHandlerName(t *testing.T) {
+	for _, tc := range []struct{ handler, middleware, want string }{
+		{"handler.GetLLMResponse", "", "GetLLMResponse"},
+		{"handler.GetLLMResponse", "_getllmresponse", "GetLLMResponse"},
+		{"handler.GetLLMResponse", "_getllmresponse0", "GetLLMResponse0"},
+		{"handler.GetLLMResponse", "_GetLLMResponse0", "GetLLMResponse0"},
+	} {
+		node := &RouterNode{Handler: tc.handler, HandlerMiddleware: tc.middleware}
+		if got := node.RawHandlerName(); got != tc.want {
+			t.Errorf("RawHandlerName(%q, %q) = %q, want %q",
+				tc.handler, tc.middleware, got, tc.want)
+		}
 	}
 }
